@@ -5,9 +5,6 @@ defmodule Cache do
 
   @type key :: binary()
   @type value :: map()
-  @type ttl :: non_neg_integer()  # seconds
-
   @callback get(key) :: {:ok, value} | :miss
-  @callback put(key, value, ttl) :: :ok
+  @callback put(key, value) :: :ok
 end
-

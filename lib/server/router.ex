@@ -1,10 +1,10 @@
 defmodule GetUniqueArtists.Router do
   use Plug.Router
 
-  plug Plug.Logger
-  plug Plug.Parsers, parsers: [:urlencoded, :multipart]
-  plug :match
-  plug :dispatch
+  plug(Plug.Logger)
+  plug(Plug.Parsers, parsers: [:urlencoded, :multipart])
+  plug(:match)
+  plug(:dispatch)
 
   get "/" do
     conn
@@ -43,7 +43,7 @@ defmodule GetUniqueArtists.Router do
   get "/artists" do
     deck_url = conn.params["url"]
 
-    case GetUniqueArtists.get_artists(deck_url) do
+    case GetUniqueArtists.get_unique_artists(deck_url) do
       {:ok, artists} ->
         html = """
           <!DOCTYPE html>
@@ -89,6 +89,7 @@ defmodule GetUniqueArtists.Router do
             </body>
           </html>
         """
+
         conn
         |> put_resp_content_type("text/html", "utf-8")
         |> send_resp(400, html)
@@ -99,4 +100,3 @@ defmodule GetUniqueArtists.Router do
     send_resp(conn, 404, "404 Not found")
   end
 end
-

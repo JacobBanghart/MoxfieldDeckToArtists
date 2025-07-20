@@ -1,31 +1,44 @@
 defmodule GetUniqueArtists do
+  @moduledoc """
+  GetUniqueArtists
+
+  Fetches and lists unique Magic: The Gathering card artists from a Moxfield deck URL using Scryfall API.
+  """
+
   @scryfall_url "https://api.scryfall.com/cards/collection"
   @cache Cache.InMemory
   @batch_size 75
-  @cache_ttl 7 * 24 * 60 * 60 # 7 days in seconds
 
   ##########################################
   # ✅ Public Entrypoints
   ##########################################
 
-  def get_artists(moxfield_url) do
+  @doc """
+  Given a Moxfield deck URL, returns {:ok, artists} with a list of unique artist names, or {:error, reason}.
+  Handles all error cases explicitly.
+  """
+  def get_unique_artists(moxfield_url) do
     IO.puts("🔗 Extracting deck ID from #{moxfield_url}")
+
     with {:ok, deck_id} <- extract_deck_id(moxfield_url),
-         {:ok, deck} <- fetch_deck(deck_id),
-         card_ids when is_list(card_ids) <- get_scryfall_ids(deck),
-         artists when is_list(artists) <- fetch_artists_bulk(card_ids) do
+         {:ok, deck} <- fetch_deck_from_api(deck_id),
+         card_ids when is_list(card_ids) <- get_scryfall_card_ids(deck),
+         artists when is_list(artists) <- get_artists_from_scryfall(card_ids) do
       {:ok, artists}
     else
       {:error, reason} -> {:error, reason}
       nil -> {:error, "Invalid Moxfield URL"}
-      _ -> {:error, "Unexpected error occurred"}
+      other -> {:error, inspect(other)}
     end
   end
 
+  @doc """
+  Runs the CLI entrypoint for fetching and printing unique artists from a Moxfield deck URL.
+  """
   def run([moxfield_url]) do
-    start_cache()
+    init_cache()
 
-    case get_artists(moxfield_url) do
+    case get_unique_artists(moxfield_url) do
       {:ok, artists} ->
         IO.puts("\n🎨 Unique Artists (#{length(artists)} total):\n")
 
@@ -45,25 +58,42 @@ defmodule GetUniqueArtists do
   # 🔗 URL & Deck Fetching
   ##########################################
 
-  defp extract_deck_id(url) do
+  @doc """
+  Extracts the deck ID from a Moxfield deck URL.
+  Returns {:ok, deck_id} or {:error, reason}.
+  """
+  def extract_deck_id(url) do
     case URI.parse(url) do
       %URI{path: path} when is_binary(path) ->
-        path
-        |> String.split("/")
-        |> Enum.drop_while(&(&1 != "decks"))
-        |> Enum.at(1)
-        |> case do
-          nil -> {:error, "No deck ID found"}
-          id -> {:ok, id}
+        if String.contains?(path, "/decks/") do
+          parts =
+            path
+            |> String.split("/")
+            |> Enum.drop_while(&(&1 != "decks"))
+            |> Enum.at(1)
+
+          case parts do
+            nil -> {:error, "No deck ID found"}
+            "" -> {:error, "No deck ID found"}
+            id -> {:ok, id}
+          end
+        else
+          {:error, "Invalid URL"}
         end
 
-      _ -> {:error, "Invalid URL"}
+      _ ->
+        {:error, "Invalid URL"}
     end
   end
 
-  defp fetch_deck(deck_id) do
+  @doc """
+  Fetches deck data from the Moxfield API given a deck ID.
+  Returns {:ok, deck} or {:error, reason}. Handles JSON decode errors.
+  """
+  def fetch_deck_from_api(deck_id) do
     IO.puts("📦 Fetching deck https://api2.moxfield.com/v3/decks/all/#{deck_id}")
     url = "https://api2.moxfield.com/v3/decks/all/#{deck_id}"
+
     headers = [
       {"Accept", "application/json"},
       {"User-Agent", "Elixir HTTP Client"}
@@ -71,13 +101,21 @@ defmodule GetUniqueArtists do
 
     case HTTPoison.get(url, headers, follow_redirect: true) do
       {:ok, %{status_code: 200, body: body}} ->
-        Jason.decode(body)
+        case Jason.decode(body) do
+          {:ok, deck} ->
+            {:ok, deck}
+
+          {:error, decode_error} ->
+            IO.warn("⚠️ JSON decode error: #{inspect(decode_error)}")
+            {:error, "Deck JSON decode failed"}
+        end
 
       {:ok, %{status_code: status, body: body}} ->
         IO.warn("⚠️ HTTP error: status #{status}, body: #{body}")
         {:error, "Deck fetch failed"}
 
       {:error, reason} ->
+        IO.warn("❌ HTTP error: #{inspect(reason)}")
         {:error, "Deck fetch failed: #{inspect(reason)}"}
     end
   end
@@ -86,7 +124,10 @@ defmodule GetUniqueArtists do
   # 🧠 Card & Artist Logic
   ##########################################
 
-  defp get_scryfall_ids(deck) do
+  @doc """
+  Extracts unique Scryfall card IDs from a deck data structure.
+  """
+  def get_scryfall_card_ids(deck) do
     cards = get_in(deck, ["boards", "mainboard", "cards"]) || %{}
 
     cards
@@ -96,15 +137,23 @@ defmodule GetUniqueArtists do
     |> Enum.uniq()
   end
 
-  defp fetch_artists_bulk(ids) do
-    start_cache()
+  @doc """
+  Fetches and returns a list of unique artists from Scryfall given a list of card IDs.
+  """
+  def get_artists_from_scryfall(ids) do
+    init_cache()
+
     ids
     |> Stream.chunk_every(@batch_size)
-    |> Enum.reduce(MapSet.new(), &fetch_chunk/2)
+    |> Enum.reduce(MapSet.new(), &fetch_scryfall_batch/2)
     |> MapSet.to_list()
   end
 
-  defp fetch_chunk(batch_ids, acc) do
+  @doc """
+  Fetches a batch of cards from Scryfall and adds their artists to the accumulator set.
+  Handles all error cases explicitly.
+  """
+  def fetch_scryfall_batch(batch_ids, acc) do
     {cached, to_fetch} =
       Enum.split_with(batch_ids, fn id ->
         case @cache.get(id) do
@@ -115,8 +164,10 @@ defmodule GetUniqueArtists do
 
     acc =
       Enum.reduce(cached, acc, fn id, acc ->
-        {:ok, card} = @cache.get(id)
-        extract_artists(card, acc)
+        case @cache.get(id) do
+          {:ok, card} -> add_artists_to_set(card, acc)
+          :miss -> acc
+        end
       end)
 
     if to_fetch == [] do
@@ -124,24 +175,31 @@ defmodule GetUniqueArtists do
     else
       IO.puts("🎴 Fetching #{length(to_fetch)} cards from Scryfall...")
 
-      body = Jason.encode!(%{
-        "identifiers" => Enum.map(to_fetch, &%{"id" => &1})
-      })
+      body =
+        Jason.encode!(%{
+          "identifiers" => Enum.map(to_fetch, &%{"id" => &1})
+        })
 
-      case HTTPoison.post(@scryfall_url, body, [{"Content-Type", "application/json"}], recv_timeout: 30_000) do
+      case HTTPoison.post(@scryfall_url, body, [{"Content-Type", "application/json"}],
+             recv_timeout: 30_000
+           ) do
         {:ok, %{status_code: 200, body: body}} ->
           case Jason.decode(body) do
             {:ok, %{"data" => cards, "not_found" => not_found}} ->
               if Enum.any?(not_found), do: IO.warn("⚠️ Not found: #{inspect(not_found)}")
-              cache_all(cards)
-              Enum.reduce(cards, acc, &extract_artists(&1, &2))
+              cache_scryfall_cards(cards)
+              Enum.reduce(cards, acc, &add_artists_to_set(&1, &2))
 
             {:ok, %{"data" => cards}} ->
-              cache_all(cards)
-              Enum.reduce(cards, acc, &extract_artists(&1, &2))
+              cache_scryfall_cards(cards)
+              Enum.reduce(cards, acc, &add_artists_to_set(&1, &2))
 
-            _ ->
-              IO.warn("⚠️ Failed to parse Scryfall response")
+            {:error, decode_error} ->
+              IO.warn("⚠️ Scryfall JSON decode error: #{inspect(decode_error)}")
+              acc
+
+            other ->
+              IO.warn("⚠️ Unexpected Scryfall response: #{inspect(other)}")
               acc
           end
 
@@ -150,37 +208,51 @@ defmodule GetUniqueArtists do
           acc
 
         {:error, reason} ->
-          IO.warn("❌ HTTP error: #{inspect(reason)}")
+          IO.warn("❌ Scryfall HTTP error: #{inspect(reason)}")
           acc
       end
     end
   end
 
-  defp cache_all(cards) do
-    Enum.each(cards, fn %{"id" => id} = card ->
-      @cache.put(id, card, @cache_ttl)
-    end)
-  end
-
-  defp extract_artists(%{} = card, acc) do
+  @doc """
+  Adds artist(s) from a card to the accumulator set.
+  """
+  def add_artists_to_set(%{} = card, acc) do
     acc
-    |> maybe_add(card["artist"])
-    |> maybe_add_faces(card["card_faces"] || [])
+    |> add_artist(card["artist"])
+    |> add_face_artists(card["card_faces"] || [])
   end
 
-  defp maybe_add(set, artist) when is_binary(artist),
+  @doc """
+  Adds a single artist to the set if present.
+  """
+  def add_artist(set, artist) when is_binary(artist),
     do: MapSet.put(set, String.trim(artist))
 
-  defp maybe_add(set, _), do: set
+  def add_artist(set, _), do: set
 
-  defp maybe_add_faces(set, faces) do
+  @doc """
+  Adds artists from card faces to the set.
+  """
+  def add_face_artists(set, faces) do
     Enum.reduce(faces, set, fn face, acc ->
-      maybe_add(acc, face["artist"])
+      add_artist(acc, face["artist"])
     end)
   end
 
-  defp start_cache do
+  @doc """
+  Initializes the cache if not already started.
+  """
+  def init_cache do
     unless Process.whereis(@cache), do: @cache.start_link([])
   end
-end
 
+  @doc """
+  Caches Scryfall card data in ETS.
+  """
+  def cache_scryfall_cards(cards) do
+    Enum.each(cards, fn %{"id" => id} = card ->
+      @cache.put(id, card)
+    end)
+  end
+end
