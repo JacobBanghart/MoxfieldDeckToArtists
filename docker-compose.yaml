@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: moxfielddecktoartists
+    ports:
+      - "4000:4000"
+    environment:
+      MIX_ENV: prod
+    restart: unless-stopped
+
