@@ -9,6 +9,7 @@ defmodule GetUniqueArtists do
   ##########################################
 
   def get_artists(moxfield_url) do
+    IO.puts("🔗 Extracting deck ID from #{moxfield_url}")
     with {:ok, deck_id} <- extract_deck_id(moxfield_url),
          {:ok, deck} <- fetch_deck(deck_id),
          card_ids when is_list(card_ids) <- get_scryfall_ids(deck),
@@ -40,9 +41,6 @@ defmodule GetUniqueArtists do
     end
   end
 
-  def run(_), do:
-    IO.puts("❌ Usage: elixir script.exs https://www.moxfield.com/decks/<deck-id>")
-
   ##########################################
   # 🔗 URL & Deck Fetching
   ##########################################
@@ -64,6 +62,7 @@ defmodule GetUniqueArtists do
   end
 
   defp fetch_deck(deck_id) do
+    IO.puts("📦 Fetching deck https://api2.moxfield.com/v3/decks/all/#{deck_id}")
     url = "https://api2.moxfield.com/v3/decks/all/#{deck_id}"
     headers = [
       {"Accept", "application/json"},
