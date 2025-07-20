@@ -139,35 +139,39 @@ defmodule GetUniqueArtists do
 
   @doc """
   Fetches and returns a list of unique artists from Scryfall given a list of card IDs.
+  Uses parallel batch fetching for speed.
   """
   def get_artists_from_scryfall(ids) do
     init_cache()
 
     ids
     |> Stream.chunk_every(@batch_size)
-    |> Enum.reduce(MapSet.new(), &fetch_scryfall_batch/2)
+    |> Task.async_stream(&fetch_scryfall_batch(&1, MapSet.new()), max_concurrency: 4, timeout: 60_000)
+    |> Enum.reduce(MapSet.new(), fn
+      {:ok, set}, acc -> MapSet.union(acc, set)
+      {:exit, _}, acc -> acc
+    end)
     |> MapSet.to_list()
   end
 
   @doc """
   Fetches a batch of cards from Scryfall and adds their artists to the accumulator set.
   Handles all error cases explicitly.
+  Optimized to avoid redundant cache gets.
   """
   def fetch_scryfall_batch(batch_ids, acc) do
+    # Only call @cache.get/1 once per id
     {cached, to_fetch} =
-      Enum.split_with(batch_ids, fn id ->
+      Enum.reduce(batch_ids, {[], []}, fn id, {cached, to_fetch} ->
         case @cache.get(id) do
-          {:ok, _card} -> true
-          :miss -> false
+          {:ok, card} -> {[{id, card} | cached], to_fetch}
+          :miss -> {cached, [id | to_fetch]}
         end
       end)
 
     acc =
-      Enum.reduce(cached, acc, fn id, acc ->
-        case @cache.get(id) do
-          {:ok, card} -> add_artists_to_set(card, acc)
-          :miss -> acc
-        end
+      Enum.reduce(cached, acc, fn {_id, card}, acc ->
+        add_artists_to_set(card, acc)
       end)
 
     if to_fetch == [] do
