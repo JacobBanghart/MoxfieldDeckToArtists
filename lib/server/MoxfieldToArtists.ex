@@ -1,7 +1,13 @@
 defmodule GetUniqueArtists do
   @scryfall_url "https://api.scryfall.com/cards/collection"
+  @cache Cache.InMemory
+  @batch_size 75
+  @cache_ttl 7 * 24 * 60 * 60 # 7 days in seconds
 
-  # ✅ Entry point for web/server:
+  ##########################################
+  # ✅ Public Entrypoints
+  ##########################################
+
   def get_artists(moxfield_url) do
     with {:ok, deck_id} <- extract_deck_id(moxfield_url),
          {:ok, deck} <- fetch_deck(deck_id),
@@ -15,8 +21,9 @@ defmodule GetUniqueArtists do
     end
   end
 
-  # ✅ CLI entry point (same as before)
   def run([moxfield_url]) do
+    start_cache()
+
     case get_artists(moxfield_url) do
       {:ok, artists} ->
         IO.puts("\n🎨 Unique Artists (#{length(artists)} total):\n")
@@ -34,9 +41,12 @@ defmodule GetUniqueArtists do
   end
 
   def run(_), do:
-    IO.puts("❌ Usage: elixir get_unique_artists.exs https://www.moxfield.com/decks/<deck-id>")
+    IO.puts("❌ Usage: elixir script.exs https://www.moxfield.com/decks/<deck-id>")
 
-  # 🧩 Deck ID parser
+  ##########################################
+  # 🔗 URL & Deck Fetching
+  ##########################################
+
   defp extract_deck_id(url) do
     case URI.parse(url) do
       %URI{path: path} when is_binary(path) ->
@@ -53,7 +63,6 @@ defmodule GetUniqueArtists do
     end
   end
 
-  # 🌐 Moxfield fetch
   defp fetch_deck(deck_id) do
     url = "https://api2.moxfield.com/v3/decks/all/#{deck_id}"
     headers = [
@@ -67,14 +76,17 @@ defmodule GetUniqueArtists do
 
       {:ok, %{status_code: status, body: body}} ->
         IO.warn("⚠️ HTTP error: status #{status}, body: #{body}")
-        {:error, "Moxfield error (#{status})"}
+        {:error, "Deck fetch failed"}
 
       {:error, reason} ->
         {:error, "Deck fetch failed: #{inspect(reason)}"}
     end
   end
 
-  # 🔍 Parse Scryfall IDs
+  ##########################################
+  # 🧠 Card & Artist Logic
+  ##########################################
+
   defp get_scryfall_ids(deck) do
     cards = get_in(deck, ["boards", "mainboard", "cards"]) || %{}
 
@@ -85,49 +97,73 @@ defmodule GetUniqueArtists do
     |> Enum.uniq()
   end
 
-  # 🎴 Scryfall API batching
-  defp fetch_artists_bulk(ids), do: fetch_batches(ids, 75, MapSet.new()) |> MapSet.to_list()
+  defp fetch_artists_bulk(ids) do
+    start_cache()
+    ids
+    |> Stream.chunk_every(@batch_size)
+    |> Enum.reduce(MapSet.new(), &fetch_chunk/2)
+    |> MapSet.to_list()
+  end
 
-  defp fetch_batches([], _batch_size, acc), do: acc
-
-  defp fetch_batches(ids, batch_size, acc) do
-    {batch, rest} = Enum.split(ids, batch_size)
-
-    IO.puts("🎴 Fetching batch: #{length(batch)} cards...")
-
-    body = Jason.encode!(%{
-      "identifiers" => Enum.map(batch, fn id -> %{"id" => id} end)
-    })
-
-    case HTTPoison.post(@scryfall_url, body, [{"Content-Type", "application/json"}], recv_timeout: 30_000) do
-      {:ok, %{status_code: 200, body: body}} ->
-        case Jason.decode(body) do
-          {:ok, %{"data" => cards, "not_found" => not_found}} ->
-            if Enum.any?(not_found), do: IO.warn("⚠️ Not found: #{inspect(not_found)}")
-            new_acc = Enum.reduce(cards, acc, &extract_artists(&1, &2))
-            fetch_batches(rest, batch_size, new_acc)
-
-          {:ok, %{"data" => cards}} ->
-            new_acc = Enum.reduce(cards, acc, &extract_artists(&1, &2))
-            fetch_batches(rest, batch_size, new_acc)
-
-          _ ->
-            IO.warn("⚠️ Failed to decode Scryfall response")
-            fetch_batches(rest, batch_size, acc)
+  defp fetch_chunk(batch_ids, acc) do
+    {cached, to_fetch} =
+      Enum.split_with(batch_ids, fn id ->
+        case @cache.get(id) do
+          {:ok, _card} -> true
+          :miss -> false
         end
+      end)
 
-      {:ok, %{status_code: code, body: body}} ->
-        IO.warn("⚠️ Batch failed with status #{code}: #{body}")
-        fetch_batches(rest, batch_size, acc)
+    acc =
+      Enum.reduce(cached, acc, fn id, acc ->
+        {:ok, card} = @cache.get(id)
+        extract_artists(card, acc)
+      end)
 
-      {:error, reason} ->
-        IO.warn("❌ HTTP error: #{inspect(reason)}")
-        fetch_batches(rest, batch_size, acc)
+    if to_fetch == [] do
+      acc
+    else
+      IO.puts("🎴 Fetching #{length(to_fetch)} cards from Scryfall...")
+
+      body = Jason.encode!(%{
+        "identifiers" => Enum.map(to_fetch, &%{"id" => &1})
+      })
+
+      case HTTPoison.post(@scryfall_url, body, [{"Content-Type", "application/json"}], recv_timeout: 30_000) do
+        {:ok, %{status_code: 200, body: body}} ->
+          case Jason.decode(body) do
+            {:ok, %{"data" => cards, "not_found" => not_found}} ->
+              if Enum.any?(not_found), do: IO.warn("⚠️ Not found: #{inspect(not_found)}")
+              cache_all(cards)
+              Enum.reduce(cards, acc, &extract_artists(&1, &2))
+
+            {:ok, %{"data" => cards}} ->
+              cache_all(cards)
+              Enum.reduce(cards, acc, &extract_artists(&1, &2))
+
+            _ ->
+              IO.warn("⚠️ Failed to parse Scryfall response")
+              acc
+          end
+
+        {:ok, %{status_code: code, body: body}} ->
+          IO.warn("⚠️ Scryfall request failed with status #{code}: #{body}")
+          acc
+
+        {:error, reason} ->
+          IO.warn("❌ HTTP error: #{inspect(reason)}")
+          acc
+      end
     end
   end
 
-  # 🎨 Artist parsing
-  defp extract_artists(card, acc) do
+  defp cache_all(cards) do
+    Enum.each(cards, fn %{"id" => id} = card ->
+      @cache.put(id, card, @cache_ttl)
+    end)
+  end
+
+  defp extract_artists(%{} = card, acc) do
     acc
     |> maybe_add(card["artist"])
     |> maybe_add_faces(card["card_faces"] || [])
@@ -142,6 +178,10 @@ defmodule GetUniqueArtists do
     Enum.reduce(faces, set, fn face, acc ->
       maybe_add(acc, face["artist"])
     end)
+  end
+
+  defp start_cache do
+    unless Process.whereis(@cache), do: @cache.start_link([])
   end
 end
 
