@@ -1,8 +1,8 @@
 name: Build and Publish Docker image
-
 on:
   push:
     branches: ["main"]
+    tags: ["v*"]
 
 jobs:
   build:
@@ -33,5 +33,7 @@ jobs:
       with:
         context: .
         push: true
-        tags: ghcr.io/jacobbanghart/moxfielddecktoartists:latest
+        tags: |
+          ghcr.io/jacobbanghart/moxfielddecktoartists:latest
+          ghcr.io/jacobbanghart/moxfielddecktoartists:${{ github.ref_name }}
 
