@@ -1,5 +1,3 @@
-<img src="https://r2cdn.perplexity.ai/pplx-full-logo-primary-dark%402x.png" class="logo" width="120"/>
-
 # GetUniqueArtists
 
 A simple Elixir web tool for extracting the list of unique artists from any Magic: The Gathering deck on Moxfield—designed both as a utility and as a platform for learning and experimenting with Elixir.
