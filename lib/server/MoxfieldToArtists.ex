@@ -160,13 +160,16 @@ defmodule GetUniqueArtists do
   Optimized to avoid redundant cache gets.
   """
   def fetch_scryfall_batch(batch_ids, acc) do
-    # Only call @cache.get/1 once per id
+    # Parallel cache checks using Task.async_stream
+    cache_results =
+      batch_ids
+      |> Task.async_stream(fn id -> {id, @cache.get(id)} end, max_concurrency: 8, timeout: 5_000)
+      |> Enum.map(fn {:ok, result} -> result end)
+
     {cached, to_fetch} =
-      Enum.reduce(batch_ids, {[], []}, fn id, {cached, to_fetch} ->
-        case @cache.get(id) do
-          {:ok, card} -> {[{id, card} | cached], to_fetch}
-          :miss -> {cached, [id | to_fetch]}
-        end
+      Enum.reduce(cache_results, {[], []}, fn
+        {id, {:ok, card}}, {cached, to_fetch} -> {[{id, card} | cached], to_fetch}
+        {id, :miss}, {cached, to_fetch} -> {cached, [id | to_fetch]}
       end)
 
     acc =
